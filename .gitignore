@@ -1,0 +1,16 @@
+# Kaynak installer ve çıkarılan içerik (telif/dağıtım kısıtı, repoya girmez)
+*.exe
+*.7z
+extract/
+weyv-extract/
+src/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editör / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
