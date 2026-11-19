@@ -3,7 +3,6 @@
 *.7z
 extract/
 weyv-extract/
-src/
 
 # Node
 node_modules/

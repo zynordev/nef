@@ -1,0 +1,342 @@
+diff --git a/scripts/build-helper.js b/scripts/build-helper.js
+index 355d30b..c41a7c5 100644
+--- a/scripts/build-helper.js
++++ b/scripts/build-helper.js
+@@ -27,11 +27,19 @@ const TOOLS = path.join(__dirname, '..', 'tools');
+ const PACKAGED = /[\\/]app\.asar[\\/]/.test(__dirname) && !!process.resourcesPath;
+ const BINARIES = PACKAGED ? path.join(process.resourcesPath, 'tools') : TOOLS;
+ 
+-const LOOPBACK = path.join(BINARIES, 'pulse-loopback.exe');
+-const NOW_PLAYING = path.join(BINARIES, 'pulse-nowplaying.exe');
+-// Windows only accepts a .scr as a screen saver.
+-const SCREEN_SAVER = path.join(BINARIES, 'PulseSaver.scr');
+-const SYSMON = path.join(BINARIES, 'pulse-sysmon.exe');
++const WIN = process.platform === 'win32';
++
++// On Linux the helpers are the hand-written scripts kept at the repo root
++// (nef/tools/), version-controlled alongside the port — not inside the
++// extracted weyv-app/ tree. They speak the exact same stdio contracts as the
++// Windows .exe helpers (PLAN.md Faz 1-4).
++const LINUX_TOOLS = path.join(__dirname, '..', '..', 'tools');
++
++const LOOPBACK = WIN ? path.join(BINARIES, 'pulse-loopback.exe') : path.join(LINUX_TOOLS, 'weyv-loopback');
++const NOW_PLAYING = WIN ? path.join(BINARIES, 'pulse-nowplaying.exe') : path.join(LINUX_TOOLS, 'weyv-nowplaying');
++// Windows only accepts a .scr as a screen saver; Linux has no equivalent file.
++const SCREEN_SAVER = WIN ? path.join(BINARIES, 'PulseSaver.scr') : null;
++const SYSMON = WIN ? path.join(BINARIES, 'pulse-sysmon.exe') : path.join(LINUX_TOOLS, 'weyv-sysmon');
+ 
+ function findCompiler() {
+   const root = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64');
+@@ -131,7 +139,16 @@ function compile(compiler, source, output, references, log) {
+  * with `nowPlaying` null when that optional helper is unavailable.
+  */
+ function build({ quiet = false } = {}) {
+-  if (process.platform !== 'win32') return { loopback: null, nowPlaying: null, screenSaver: null, sysmon: null };
++  // Linux: the helpers are prebuilt scripts in tools/; report the ones present.
++  if (process.platform !== 'win32') {
++    const present = (file) => (file && fs.existsSync(file) ? file : null);
++    return {
++      loopback: present(LOOPBACK),
++      nowPlaying: present(NOW_PLAYING),
++      screenSaver: null,
++      sysmon: present(SYSMON),
++    };
++  }
+ 
+   // The installer ships them prebuilt; report whichever are there.
+   if (PACKAGED) {
+diff --git a/src/main/box-widget.js b/src/main/box-widget.js
+index a37d359..79a58f4 100644
+--- a/src/main/box-widget.js
++++ b/src/main/box-widget.js
+@@ -4,7 +4,7 @@ const path = require('path');
+ const { BrowserWindow, screen } = require('electron');
+ 
+ const settings = require('./settings');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ const { clampToDisplays, snapToEdges, setChildBounds } = require('./geometry');
+ 
+ /**
+diff --git a/src/main/disks.js b/src/main/disks.js
+index f4c975b..f6292aa 100644
+--- a/src/main/disks.js
++++ b/src/main/disks.js
+@@ -5,62 +5,80 @@
+  *
+  *   [{ letter: 'C', label: 'Windows', kind: 'fixed', total, free }]
+  *
+- * Bytes, straight from Windows (GetDiskFreeSpaceExW). Network drives are left
+- * out, since asking a slow share can hang, and so are drives with nothing in
+- * them (an empty card reader or DVD drive). Read once a minute while the
+- * widget is on, and whenever the dashboard asks.
++ * Linux port: the figures come from the kernel's statvfs via `df`, instead of
++ * Windows' GetDiskFreeSpaceExW. There are no drive letters, so `letter` carries
++ * a short id derived from the mount point ("/" -> "/", "/home" -> "home") and
++ * `label` the mount point itself. Network, virtual and special filesystems are
++ * left out — only real local disks, the same spirit as the Windows version
++ * (fixed/removable, nothing empty). Read once a minute while the widget is on.
+  */
+ 
+-const koffi = require('koffi');
++const { execFileSync } = require('child_process');
+ 
+ const REFRESH_MS = 60 * 1000;
+ 
+-const kernel32 = koffi.load('kernel32.dll');
+-const GetLogicalDrives = kernel32.func('__stdcall', 'GetLogicalDrives', 'uint32', []);
+-const GetDriveTypeW = kernel32.func('__stdcall', 'GetDriveTypeW', 'uint', ['str16']);
+-const GetDiskFreeSpaceExW = kernel32.func('__stdcall', 'GetDiskFreeSpaceExW', 'bool', [
+-  'str16',
+-  koffi.out(koffi.pointer('uint64')),
+-  koffi.out(koffi.pointer('uint64')),
+-  koffi.out(koffi.pointer('uint64')),
++// Pseudo / virtual / network filesystems the widget should never list.
++const SKIP_FS = new Set([
++  'tmpfs', 'devtmpfs', 'squashfs', 'overlay', 'proc', 'sysfs', 'cgroup', 'cgroup2',
++  'devpts', 'mqueue', 'debugfs', 'tracefs', 'configfs', 'fusectl', 'pstore', 'bpf',
++  'autofs', 'binfmt_misc', 'hugetlbfs', 'ramfs', 'efivarfs', 'securityfs',
++  'nfs', 'nfs4', 'cifs', 'smbfs', 'sshfs', 'fuse.sshfs', 'fuse.gvfsd-fuse', 'fuse.portal',
++  'nsfs', 'rpc_pipefs',
+ ]);
+-const GetVolumeInformationW = kernel32.func('__stdcall', 'GetVolumeInformationW', 'bool', [
+-  'str16', koffi.out(koffi.pointer('char16_t')), 'uint', 'void *', 'void *', 'void *', 'void *', 'uint',
+-]);
+-const SetThreadErrorMode = kernel32.func('__stdcall', 'SetThreadErrorMode', 'bool', ['uint', 'void *']);
+ 
+-// No "There is no disk in the drive" box for an empty card reader.
+-const SEM_FAILCRITICALERRORS = 0x0001;
+-const SEM_NOOPENFILEERRORBOX = 0x8000;
++// Filesystems mounted here are system plumbing, not "drives" a person tracks.
++const SKIP_MOUNT_PREFIX = ['/proc', '/sys', '/dev', '/run', '/tmp', '/boot', '/snap', '/var/lib/docker'];
++
++const REMOVABLE_HINT = /^\/(media|mnt|run\/media)\//;
+ 
+-const KINDS = { 2: 'removable', 3: 'fixed', 5: 'disc', 6: 'ram' };
++function kindOf(source, mount, fsType) {
++  if (fsType === 'iso9660' || fsType === 'udf') return 'disc';
++  if (REMOVABLE_HINT.test(mount)) return 'removable';
++  return 'fixed';
++}
+ 
+-const labelBuffer = Buffer.alloc(520);
++function labelId(mount) {
++  if (mount === '/') return '/';
++  const base = mount.split('/').filter(Boolean).pop();
++  return base || mount;
++}
+ 
+ function read() {
++  // -P: POSIX columns (stable), -k: 1K blocks, -T: filesystem type.
++  let output;
+   try {
+-    SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, null);
+-  } catch {}
+-  const mask = GetLogicalDrives();
++    output = execFileSync('df', ['-PTk'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
++  } catch {
++    return [];
++  }
++
+   const drives = [];
+-  for (let i = 0; i < 26; i++) {
+-    if (!(mask & (1 << i))) continue;
+-    const letter = String.fromCharCode(65 + i);
+-    const root = `${letter}:\\`;
+-    const kind = KINDS[GetDriveTypeW(root)];
+-    if (!kind) continue; // network, unknown, no root
+-    const available = [0];
+-    const total = [0];
+-    const free = [0];
+-    if (!GetDiskFreeSpaceExW(root, available, total, free)) continue;
+-    const size = Number(total[0]);
+-    if (!size) continue;
+-    let label = '';
+-    labelBuffer.fill(0);
+-    if (GetVolumeInformationW(root, labelBuffer, 260, null, null, null, null, 0)) {
+-      label = labelBuffer.toString('ucs2').replace(/\0[\s\S]*$/, '');
+-    }
+-    drives.push({ letter, label, kind, total: size, free: Number(available[0]) });
++  const seen = new Set();
++  const lines = output.split('\n').slice(1); // drop the header row
++  for (const line of lines) {
++    // Filesystem Type 1024-blocks Used Available Capacity Mounted-on
++    const parts = line.trim().split(/\s+/);
++    if (parts.length < 7) continue;
++    const fsType = parts[1];
++    const totalKb = Number(parts[2]);
++    const availKb = Number(parts[4]);
++    const mount = parts.slice(6).join(' ');
++    const source = parts[0];
++
++    if (SKIP_FS.has(fsType)) continue;
++    if (!source.startsWith('/dev/')) continue;            // real block devices only
++    if (SKIP_MOUNT_PREFIX.some((p) => mount === p || mount.startsWith(p + '/'))) continue;
++    if (!totalKb) continue;
++    if (seen.has(source)) continue;                       // same device bind-mounted twice
++    seen.add(source);
++
++    drives.push({
++      letter: labelId(mount),
++      label: mount,
++      kind: kindOf(source, mount, fsType),
++      total: totalKb * 1024,
++      free: availKb * 1024,
++    });
+   }
+   return drives;
+ }
+diff --git a/src/main/gaming.js b/src/main/gaming.js
+index 083c508..090f7c4 100644
+--- a/src/main/gaming.js
++++ b/src/main/gaming.js
+@@ -17,7 +17,7 @@
+ const { BrowserWindow } = require('electron');
+ 
+ const settings = require('./settings');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ 
+ const POLL_MS = 2000;
+ // A game has to be seen this many polls in a row before anything changes, so
+@@ -36,6 +36,14 @@ const NOT_GAMES = new Set([
+   'startmenuexperiencehost.exe', 'lockapp.exe', 'textinputhost.exe', 'snippingtool.exe', 'screenclippinghost.exe',
+   'powerpnt.exe', 'mstsc.exe', 'vmware.exe', 'vmplayer.exe', 'virtualboxvm.exe', 'vmconnect.exe',
+   'zoom.exe', 'ms-teams.exe', 'teams.exe', 'discord.exe', 'obs64.exe', 'photos.exe', 'acrobat.exe',
++  // Linux/Hyprland window classes (win32.fullscreenApp returns an .exe name,
++  // linuxwm.fullscreenApp returns the Wayland class), so both are covered.
++  'firefox', 'firefoxdeveloperedition', 'librewolf', 'waterfox', 'zen', 'chromium', 'google-chrome',
++  'brave-browser', 'vivaldi-stable', 'microsoft-edge', 'org.mozilla.firefox',
++  'mpv', 'vlc', 'io.github.celluloid_player.celluloid', 'totem', 'spotify', 'dev.spotify.client',
++  'kodi', 'plex', 'stremio', 'netflix',
++  'zoom', 'discord', 'webcord', 'vesktop', 'com.obsproject.studio', 'obs',
++  'org.telegram.desktop', 'teams-for-linux', 'nautilus', 'dolphin', 'thunar',
+ ]);
+ 
+ const DEV = process.argv.includes('--dev');
+diff --git a/src/main/geometry.js b/src/main/geometry.js
+index e280dc8..d555784 100644
+--- a/src/main/geometry.js
++++ b/src/main/geometry.js
+@@ -1,7 +1,7 @@
+ 'use strict';
+ 
+ const { screen } = require('electron');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ 
+ /** Screen geometry shared by the desktop widgets (visualizer and clock). */
+ 
+@@ -54,6 +54,14 @@ function snapToEdges(x, y, width, height) {
+  * desktop's origin are converted, each by its own monitor's scale.
+  */
+ function setChildBounds(win, hwnd, rect) {
++  // Linux/Wayland: the window is never re-parented, so Electron's own bounds
++  // are already in the right coordinate space. No DIP→pixel or origin maths.
++  if (process.platform !== 'win32') {
++    win.setMinimumSize(rect.width, rect.height);
++    win.setMaximumSize(rect.width, rect.height);
++    win.setBounds({ x: Math.round(rect.x), y: Math.round(rect.y), width: rect.width, height: rect.height });
++    return;
++  }
+   const physical = screen.dipToScreenRect(null, rect);
+   const corners = screen.getAllDisplays().map((d) => screen.dipToScreenRect(null, d.bounds));
+   const origin = {
+diff --git a/src/main/main.js b/src/main/main.js
+index d2cb157..2549387 100644
+--- a/src/main/main.js
++++ b/src/main/main.js
+@@ -17,7 +17,7 @@ if (app.isPackaged) {
+ }
+ 
+ const settings = require('./settings');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ const { buildTray, destroyTray, refreshTray, setAudioDevices } = require('./tray');
+ const loopback = require('./loopback');
+ const nowplaying = require('./nowplaying');
+@@ -1167,7 +1167,11 @@ function patchSettings(patch) {
+     screensaver.setTimeout(next.saverTimeout);
+   }
+   if (patch.launchAtLogin !== undefined && patch.launchAtLogin !== before.launchAtLogin) {
+-    app.setLoginItemSettings({ openAtLogin: next.launchAtLogin, path: process.execPath });
++    if (process.platform === 'win32') {
++      app.setLoginItemSettings({ openAtLogin: next.launchAtLogin, path: process.execPath });
++    } else {
++      require('./autostart').set(next.launchAtLogin);
++    }
+   }
+   if (Object.keys(patch).some((key) => key.startsWith('clock'))) clock.sync(before, next);
+   if (Object.keys(patch).some((key) => key.startsWith('lyrics'))) lyricsWindow.sync(before, next);
+diff --git a/src/main/profiles.js b/src/main/profiles.js
+index 8097a04..d19af18 100644
+--- a/src/main/profiles.js
++++ b/src/main/profiles.js
+@@ -24,7 +24,7 @@
+  */
+ 
+ const settings = require('./settings');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ 
+ // Settings that belong to the PC or the person rather than to a layout.
+ const LAYOUT_SKIP = new Set([
+diff --git a/src/main/scene-window.js b/src/main/scene-window.js
+index e7d0681..673087c 100644
+--- a/src/main/scene-window.js
++++ b/src/main/scene-window.js
+@@ -4,7 +4,7 @@ const path = require('path');
+ const { BrowserWindow, screen } = require('electron');
+ 
+ const settings = require('./settings');
+-const win32 = require('./win32');
++const win32 = require('./wm');
+ const { virtualOrigin, setChildBounds } = require('./geometry');
+ 
+ /**
+diff --git a/src/main/screensaver.js b/src/main/screensaver.js
+index c193d7b..07a7182 100644
+--- a/src/main/screensaver.js
++++ b/src/main/screensaver.js
+@@ -15,6 +15,22 @@ const { execFileSync } = require('child_process');
+ 
+ const { build, SCREEN_SAVER } = require('../../scripts/build-helper');
+ 
++if (process.platform !== 'win32') {
++  // Linux: there is no registry screen-saver slot to register into. The proper
++  // equivalent is a hypridle hook, which is Faz 5 polish (see PLAN.md). Until
++  // then these are safe no-ops so the Screen saver setting reads "unavailable"
++  // and nothing in main.js breaks.
++  module.exports = {
++    enable: () => ({ ok: false, error: 'Linux ekran koruyucu entegrasyonu henüz yok (hypridle: Faz 5)' }),
++    disable: () => ({ ok: true }),
++    status: () => ({ available: false, registered: false, current: '', timeoutSeconds: 0, active: false }),
++    isRegistered: () => false,
++    setTimeout: () => {},
++    TARGET_FILE: null,
++  };
++  return;
++}
++
+ const KEY = 'HKCU\\Control Panel\\Desktop';
+ // A copy of the screen saver we replaced, for the uninstaller (build/installer.nsh),
+ // which can't read settings.json. Settings still hold the copy the app uses.
+diff --git a/src/main/updater.js b/src/main/updater.js
+index 260e810..2f9f90c 100644
+--- a/src/main/updater.js
++++ b/src/main/updater.js
+@@ -55,6 +55,14 @@ function init(options) {
+     return;
+   }
+ 
++  // Linux: the update feed serves Windows installer artifacts, so auto-update
++  // is intentionally off in this port (PLAN.md Faz 4). The app is updated by
++  // re-running the build from source.
++  if (process.platform !== 'win32') {
++    set({ status: 'unavailable', message: 'Otomatik güncelleme Linux portunda kapalı.' });
++    return;
++  }
++
+   ({ autoUpdater: updater } = require('electron-updater'));
+   // The user decides: nothing downloads until they say "Update now", and
+   // quitting never installs anything behind their back.

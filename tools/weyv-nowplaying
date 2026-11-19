@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+weyv-nowplaying — Linux karşılığı PulseNowPlaying.cs (Windows SMTC).
+
+MPRIS (D-Bus) üzerinden çalan parçayı izler ve Weyv'in beklediği satır-satır
+JSON sözleşmesiyle stdout'a yazar:
+
+  stdout:
+    {"playing":bool,"title":..,"artist":..,"album":..,"art":..,
+     "source":"mpris","app":<player>,"status":<Playing|Paused|Stopped>}
+    {"timeline":true,"position":<ms>,"duration":<ms>,"updated":<unixMs>}
+  stdin (satır satır komut):
+    play-pause | next | previous
+
+Uygulama: `playerctl --follow`. Windows'taki pencere başlığından okuma ve
+"Artist — Album" ayrıştırma hack'leri Linux'ta gereksiz; MPRIS alanları zaten
+ayrıdır (source daima "mpris", bu yüzden nowplaying.js'teki o kod yolları ölü
+kalır — sözleşme bozulmasın diye kasıtlı).
+"""
+
+import json
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+# Alanları ayırmak için Unit Separator; başlık/sanatçı içinde boşluk olabilir.
+US = "\x1f"
+TEMPLATE = US.join([
+    "{{status}}", "{{title}}", "{{artist}}", "{{album}}",
+    "{{mpris:artUrl}}", "{{position}}", "{{mpris:length}}", "{{playerName}}",
+])
+
+COMMANDS = {"play-pause", "next", "previous"}
+
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        raise SystemExit(0)
+
+
+def to_ms(micro):
+    try:
+        return int(micro) // 1000
+    except (ValueError, TypeError):
+        return 0
+
+
+def read_commands():
+    """Çağırandan gelen medya komutlarını playerctl'e ilet."""
+    for line in sys.stdin:
+        name = line.strip()
+        if name in COMMANDS:
+            try:
+                subprocess.run(["playerctl", name], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+
+def main():
+    if not shutil.which("playerctl"):
+        sys.stderr.write("[weyv-nowplaying] playerctl bulunamadı\n")
+        sys.exit(2)
+
+    threading.Thread(target=read_commands, daemon=True).start()
+
+    # --follow: herhangi bir alan değişince yeni bir satır basar. Oynatıcı yoksa
+    # boş satır gelir → "çalmıyor".
+    proc = subprocess.Popen(
+        ["playerctl", "--follow", "--format", TEMPLATE, "metadata"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+
+    last_track_key = None
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                emit({"playing": False})
+                last_track_key = None
+                continue
+
+            parts = line.split(US)
+            while len(parts) < 8:
+                parts.append("")
+            status, title, artist, album, art, position, length, player = parts[:8]
+
+            playing = status == "Playing"
+            track = {
+                "playing": playing,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "art": art,
+                "source": "mpris",
+                "app": player,
+                "status": status or "Stopped",
+            }
+            emit(track)
+
+            # Parça/konum bilgisi: renderer bundan ileriye sayar.
+            duration = to_ms(length)
+            pos = to_ms(position)
+            if duration > 0:
+                emit({
+                    "timeline": True,
+                    "position": pos,
+                    "duration": duration,
+                    "updated": int(time.time() * 1000),
+                })
+            last_track_key = (title, artist)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

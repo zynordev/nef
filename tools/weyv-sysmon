@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+weyv-sysmon — Linux karşılığı PulseSysmon.cs.
+
+Saniyede bir GPU kullanımı ve ağ hızını Weyv'in beklediği satır-satır JSON
+sözleşmesiyle yazar (CPU ve RAM'i Node kendisi hesaplar):
+
+  stdout (satır satır): {"gpu":37.5,"down":182340,"up":9120}
+    gpu  : 0-100, kullanılamıyorsa -1
+    down/up : bayt/saniye (tüm fiziksel arayüzlerin toplamı farkı)
+
+stdin kapanınca (çağıran durdurduğunda) süreç sonlanır.
+
+GPU kaynakları (sırayla denenir):
+  - AMD    : /sys/class/drm/card*/device/gpu_busy_percent
+  - NVIDIA : nvidia-smi --query-gpu=utilization.gpu
+  - Intel  : (intel_gpu_top gerektirir; yoksa -1)
+"""
+
+import glob
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+INTERVAL = 1.0
+
+_have_nvidia = None
+
+
+def gpu_amd():
+    for path in glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"):
+        try:
+            with open(path, "r") as handle:
+                return float(handle.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def gpu_nvidia():
+    global _have_nvidia
+    if _have_nvidia is False:
+        return None
+    if _have_nvidia is None:
+        _have_nvidia = shutil.which("nvidia-smi") is not None
+        if not _have_nvidia:
+            return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2, check=True,
+        )
+        first = out.stdout.strip().splitlines()[0]
+        return float(first.strip())
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return None
+
+
+def read_gpu():
+    value = gpu_amd()
+    if value is None:
+        value = gpu_nvidia()
+    if value is None:
+        return -1.0
+    return max(0.0, min(100.0, value))
+
+
+def read_net_totals():
+    """Tüm fiziksel arayüzler için (rx_bytes, tx_bytes) toplamı."""
+    rx = tx = 0
+    try:
+        with open("/proc/net/dev", "r") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return rx, tx
+    for line in lines[2:]:
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if not rest or name == "lo" or name.startswith(("veth", "docker", "br-", "virbr")):
+            continue
+        fields = rest.split()
+        if len(fields) >= 9:
+            try:
+                rx += int(fields[0])
+                tx += int(fields[8])
+            except ValueError:
+                pass
+    return rx, tx
+
+
+def watch_stdin_close():
+    """Çağıran stdin'i kapatınca temiz çık."""
+    try:
+        for _ in sys.stdin:
+            pass
+    except (OSError, ValueError):
+        pass
+    os._exit(0)
+
+
+def main():
+    threading.Thread(target=watch_stdin_close, daemon=True).start()
+
+    last_rx, last_tx = read_net_totals()
+    last_t = time.monotonic()
+
+    while True:
+        time.sleep(INTERVAL)
+        now = time.monotonic()
+        dt = now - last_t
+        rx, tx = read_net_totals()
+        down = max(0, int((rx - last_rx) / dt)) if dt > 0 else 0
+        up = max(0, int((tx - last_tx) / dt)) if dt > 0 else 0
+        last_rx, last_tx, last_t = rx, tx, now
+
+        line = '{"gpu":%s,"down":%d,"up":%d}\n' % (
+            ("%.1f" % read_gpu()), down, up,
+        )
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            break
+
+
+if __name__ == "__main__":
+    main()
