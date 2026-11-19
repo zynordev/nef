@@ -1,0 +1,20 @@
+{
+  "name": "nef",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Weyv 1.1.21 Linux/Hyprland portu",
+  "scripts": {
+    "start": "electron weyv-app"
+  },
+  "devDependencies": {
+    "electron": "33.4.11"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "koffi": "^2.9.0"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "koffi@2.16.4": true
+  }
+}
