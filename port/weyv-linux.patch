@@ -243,7 +243,7 @@ index e280dc8..d555784 100644
    const corners = screen.getAllDisplays().map((d) => screen.dipToScreenRect(null, d.bounds));
    const origin = {
 diff --git a/src/main/main.js b/src/main/main.js
-index d2cb157..2549387 100644
+index d2cb157..fa67c8b 100644
 --- a/src/main/main.js
 +++ b/src/main/main.js
 @@ -17,7 +17,7 @@ if (app.isPackaged) {
@@ -255,7 +255,18 @@ index d2cb157..2549387 100644
  const { buildTray, destroyTray, refreshTray, setAudioDevices } = require('./tray');
  const loopback = require('./loopback');
  const nowplaying = require('./nowplaying');
-@@ -1167,7 +1167,11 @@ function patchSettings(patch) {
+@@ -386,7 +386,9 @@ function createWidget() {
+     hasShadow: false,
+     acceptFirstMouse: true,
+     roundedCorners: false,
+-    title: 'Weyv',
++    // Benzersiz başlık: Linux'ta hyprwinwrap'in yalnız bu görselleştiriciyi
++    // duvar kağıdı olarak hedefleyebilmesi için (dashboard/stage da 'Weyv' idi).
++    title: process.platform === 'win32' ? 'Weyv' : 'Weyv Visualizer',
+     icon: path.join(__dirname, '..', '..', 'assets', 'icon.png'),
+     webPreferences: {
+       preload: path.join(__dirname, 'preload.js'),
+@@ -1167,7 +1169,11 @@ function patchSettings(patch) {
      screensaver.setTimeout(next.saverTimeout);
    }
    if (patch.launchAtLogin !== undefined && patch.launchAtLogin !== before.launchAtLogin) {
