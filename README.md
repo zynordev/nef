@@ -1,4 +1,4 @@
-# nef-oclak
+# nef
 
 Weyv 1.1.21 (Windows masaüstü canlı müzik görselleştiricisi) için Linux / Hyprland portu.
 
